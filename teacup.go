@@ -5,6 +5,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"time"
@@ -74,10 +75,10 @@ func (t *teacup) matchRequest(writer http.ResponseWriter, request *http.Request)
 }
 
 func (t *teacup) serveFile(writer http.ResponseWriter, request *http.Request) {
-	if t.FileWhitelist.MatchString(request.URL.Path) {
-		http.ServeFile(writer, request, request.URL.Path[1:])
-	} else {
+	if _, err := os.Stat(request.URL.Path); os.IsNotExist(err) || !t.FileWhitelist.MatchString(request.URL.Path) {
 		t.serveError(writer, http.StatusNotFound)
+	} else {
+		http.ServeFile(writer, request, request.URL.Path[1:])
 	}
 }
 
