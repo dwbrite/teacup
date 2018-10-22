@@ -99,7 +99,7 @@ func selectContents(queryRows func(db sql.DB) (*sql.Rows, error), dbInfo string)
 }
 
 func (t *teacup) CreateTable(name string, uniqueTitles bool) {
-	db, _ := sql.Open("postgres", t.DbInfo)
+	db, _ := sql.Open("postgres", t.dbInfo)
 	defer db.Close()
 
 	unique := ""

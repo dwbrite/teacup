@@ -11,18 +11,20 @@ import (
 )
 
 type teacup struct {
-	Port    uint16
-	DbInfo  string
+	dbInfo  string
 	TlsPair *TlsKeyPair
 
 	FileWhitelist regexp.Regexp
-	DirBlacklist  regexp.Regexp
+	DirBlacklist  []string//regexp.Regexp
 
 	Log    *log.Logger
 	errors tcErrors
 
 	tables   map[string]bool
 	webpages map[string]func(http.Request, string) (*template.Template, interface{})
+
+	Server *http.Server
+	Mux    *http.ServeMux
 }
 
 type TlsKeyPair struct {
@@ -38,42 +40,66 @@ type PageContents struct {
 	PostDate time.Time
 }
 
-func NewTeacup(port uint16, dbInfo string, pair *TlsKeyPair, fileWhitelist regexp.Regexp, dirBlacklist regexp.Regexp, log *log.Logger) *teacup {
+type TemplateContent struct {
+	Template *template.Template
+	Content  interface{}
+}
+
+type ContentFn func(r http.Request, dbInfo string) (*TemplateContent, error)
+
+type teacupFnPair struct {
+	t *teacup
+	fn ContentFn
+}
+
+func NewTeacup(port uint16, dbInfo string, pair *TlsKeyPair, fileWhitelist []string, dirBlacklist []string, log *log.Logger) *teacup {
+	// create whitelist regex. The final result will look something like:
+	// "^/.*\\.(html|css|scss|map|js|png|jpg|gif|webm|ico|md|mp3|mp4|ttf|woff|woff2|eot)$"
+	whitelistStr := "^/.*\\.("
+	for i, str := range fileWhitelist {
+		whitelistStr += str
+		if i < len(fileWhitelist) -1 {
+			whitelistStr += "|"
+		}
+	}
+	whitelistStr += ")$"
+
+	mux := http.NewServeMux()
+
+	server := &http.Server{
+		Addr:           ":"+strconv.Itoa(int(port)),
+		Handler:        mux,
+	}
+
 	t := teacup{
-		port,
 		dbInfo,
 		pair,
-		fileWhitelist,
+		*regexp.MustCompile(whitelistStr),
 		dirBlacklist,
 		log,
 		newTcErrors(),
 		make(map[string]bool),
 		make(map[string]func(http.Request, string) (*template.Template, interface{})),
+		server,
+		mux,
 	}
+
 	return &t
 }
 
 func (t *teacup) StartServer() {
-	http.HandleFunc("/", t.matchRequest)
+	for _, pattern := range t.DirBlacklist {
+		t.Mux.HandleFunc(pattern, t.denyRequest)
+	}
+
 	if t.TlsPair == nil {
-		t.Log.Fatal(http.ListenAndServe(":"+strconv.Itoa(int(t.Port)), nil))
+		t.Log.Fatal(t.Server.ListenAndServe())
 	} else {
-		t.Log.Fatal(http.ListenAndServeTLS(":"+strconv.Itoa(int(t.Port)), t.TlsPair.Cert, t.TlsPair.Key, nil))
+		t.Log.Fatal(t.Server.ListenAndServeTLS(t.TlsPair.Cert, t.TlsPair.Key))
 	}
 }
 
-func (t *teacup) matchRequest(writer http.ResponseWriter, request *http.Request) {
-	path := request.URL.Path
-
-	switch {
-	case t.DirBlacklist.MatchString(path):
-		t.serveError(writer, http.StatusForbidden)
-	default:
-		t.serveContent(writer, request)
-	}
-}
-
-func (t *teacup) serveFile(writer http.ResponseWriter, request *http.Request) {
+func (t *teacup) ServeFile(writer http.ResponseWriter, request *http.Request) {
 	if t.FileWhitelist.MatchString(request.URL.Path) {
 		http.ServeFile(writer, request, request.URL.Path[1:])
 	} else {
@@ -81,30 +107,25 @@ func (t *teacup) serveFile(writer http.ResponseWriter, request *http.Request) {
 	}
 }
 
-func (t *teacup) serveContent(writer http.ResponseWriter, request *http.Request) {
-	path := request.URL.Path
-	for pathRegex := range t.webpages {
-		if regexp.MustCompile(pathRegex).MatchString(path) {
-			dynPage := t.webpages[pathRegex]
-			tmpl, content := dynPage(*request, t.DbInfo)
-			if content == nil {
-				http.Redirect(writer, request, request.URL.Path, http.StatusSeeOther)
-				return
-			}
-
-			err := tmpl.Execute(writer, content)
-			if t.checkAndLogError(err) {
-				t.serveError(writer, http.StatusInternalServerError)
-			}
-			return
-		}
+func (tFn teacupFnPair) serve(writer http.ResponseWriter, request *http.Request) {
+	tc, err := tFn.fn(*request, tFn.t.dbInfo)
+	if tc.Content == nil {
+		http.Redirect(writer, request, request.URL.Path, http.StatusSeeOther)
+		return
 	}
 
-	t.serveFile(writer, request)
+	err = tc.Template.Execute(writer, tc.Content)
+	if err != nil {
+		tFn.t.ServeFile(writer, request)
+	}
 }
 
-func (t *teacup) AddTemplateContent(pathRegex string, fn func(http.Request, string) (*template.Template, interface{})) {
-	regexp.MustCompile(pathRegex)
-	t.webpages[pathRegex] = fn
+func (t *teacup) HandleFunc(pattern string, fn ContentFn) {
+	tFn := teacupFnPair{t, fn}
+	t.Mux.HandleFunc(pattern, tFn.serve)
+}
+
+func (t *teacup) denyRequest(writer http.ResponseWriter, request *http.Request) {
+	t.serveError(writer, http.StatusNotFound)
 }
 
